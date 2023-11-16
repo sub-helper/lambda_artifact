@@ -1,0 +1,16 @@
+{
+    "files.associations": {
+        "*.ipp": "cpp",
+        "bitset": "cpp",
+        "vector": "cpp",
+        "future": "cpp",
+        "iosfwd": "cpp",
+        "istream": "cpp",
+        "ostream": "cpp",
+        "streambuf": "cpp",
+        "functional": "cpp",
+        "regex": "cpp",
+        "tuple": "cpp",
+        "optional": "cpp"
+    }
+}

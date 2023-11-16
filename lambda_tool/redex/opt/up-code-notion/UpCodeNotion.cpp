@@ -1,0 +1,602 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+/*
+ * This pass eliminates gotos by moving trivial instructions such a consts and
+ * moves before a conditional branch.
+ *
+ * For example:
+ *
+ *       IF_EQZ v2, L1
+ *       CONST v0, 1
+ *       ... (GOTO elsewhere or RETURN or THROW)
+ *   L1: CONST v0, 0 // where L1 is only reachable via the above IF-instruction
+ *       GOTO L2
+ *
+ * becomes
+ *
+ *       CONST v0, 0
+ *       IF_EQZ v2, L2
+ *       CONST v0, 1
+ *       ...
+ *
+ */
+
+#include "UpCodeNotion.h"
+
+#include <vector>
+
+#include "ControlFlow.h"
+#include "DexClass.h"
+#include "DexUtil.h"
+#include "IRCode.h"
+#include "IRInstruction.h"
+#include "IROpcode.h"
+#include "PassManager.h"
+#include "RedexContext.h"
+#include "Show.h"
+#include "SourceBlocks.h"
+#include "Trace.h"
+#include "TypeInference.h"
+#include "Walkers.h"
+
+namespace {
+
+constexpr const char* METRIC_INSTRUCTIONS_MOVED = "num_instructions_moved";
+constexpr const char* METRIC_BRANCHES_MOVED_OVER = "num_branches_moved_over";
+constexpr const char* METRIC_INVERTED_CONDITIONAL_BRANCHES =
+    "num_inverted_conditional_branches";
+constexpr const char* METRIC_CLOBBERED_REGISTERS = "num_clobbered_registers";
+constexpr const char* METRIC_SKIPPED_BRANCHES = "num_skipped_branches";
+
+} // namespace
+
+// Helper function that checks if a branch is hot.
+// Here we assume that :
+// 1. if a represenative block is hit, the rest of source blocks are also
+// covered.
+// 2. if a represenative block is hit via any one interaction, it is considered
+// to be "hot" Potentially introduce hotness threshhold here.
+
+bool UpCodeNotionPass::is_hot(cfg::Block* b) {
+  const auto* rep_block = source_blocks::get_first_source_block(b);
+  if (rep_block == nullptr) {
+    return false;
+  }
+  bool is_hot = false;
+  rep_block->foreach_val_early([&is_hot](const auto& val) {
+    is_hot = (val && val->val > 0.0f);
+    return is_hot;
+  });
+
+  return is_hot;
+}
+
+// Helper function that scans a block for leading const and move instructions,
+// and returning a value that indicates whether there's no other kind of
+// instruction in the block.
+bool UpCodeNotionPass::gather_movable_instructions(
+    cfg::Block* b, std::vector<IRInstruction*>* instructions) {
+  for (auto& mie : InstructionIterable(b)) {
+    auto insn = mie.insn;
+
+    // We really only support at this time...
+    // - const, not const-wide, const-class, or const-string.
+    // - move and move-object, not move-wide
+    // - other trivial side-effect free computations that are not wide
+    switch (insn->opcode()) {
+    case OPCODE_NOP:
+      continue;
+
+    case OPCODE_CONST:
+    case OPCODE_MOVE:
+    case OPCODE_MOVE_OBJECT:
+
+    case OPCODE_NEG_INT:
+    case OPCODE_NOT_INT:
+    case OPCODE_NEG_FLOAT:
+    case OPCODE_INT_TO_FLOAT:
+    case OPCODE_FLOAT_TO_INT:
+    case OPCODE_INT_TO_BYTE:
+    case OPCODE_INT_TO_CHAR:
+    case OPCODE_INT_TO_SHORT:
+    case OPCODE_CMPL_FLOAT:
+    case OPCODE_CMPG_FLOAT:
+
+    case OPCODE_ADD_INT:
+    case OPCODE_SUB_INT:
+    case OPCODE_MUL_INT:
+    case OPCODE_AND_INT:
+    case OPCODE_OR_INT:
+    case OPCODE_XOR_INT:
+    case OPCODE_SHL_INT:
+    case OPCODE_SHR_INT:
+    case OPCODE_USHR_INT:
+    case OPCODE_ADD_INT_LIT16:
+    case OPCODE_RSUB_INT:
+    case OPCODE_MUL_INT_LIT16:
+    case OPCODE_AND_INT_LIT16:
+    case OPCODE_OR_INT_LIT16:
+    case OPCODE_XOR_INT_LIT16:
+    case OPCODE_ADD_INT_LIT8:
+    case OPCODE_RSUB_INT_LIT8:
+    case OPCODE_MUL_INT_LIT8:
+    case OPCODE_AND_INT_LIT8:
+    case OPCODE_OR_INT_LIT8:
+    case OPCODE_XOR_INT_LIT8:
+    case OPCODE_SHL_INT_LIT8:
+    case OPCODE_SHR_INT_LIT8:
+    case OPCODE_USHR_INT_LIT8:
+      instructions->push_back(insn);
+      continue;
+
+    default:
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// Helper function that, given a branch and a goto edge, figures out if all
+// movable instructions of the branch edge target block have a matching
+// (same dest register) leading instruction in the goto edge target block,
+// and that move-instructions don't read what's written.
+bool UpCodeNotionPass::gather_instructions_to_insert(
+    cfg::Edge* branch_edge,
+    cfg::Edge* goto_edge,
+    std::vector<IRInstruction*>* instructions_to_insert) {
+  cfg::Block* branch_block = branch_edge->target();
+  // The branch edge target block must end in a goto, and
+  // have a unique predecessor.
+  if (branch_block->branchingness() != opcode::BRANCH_GOTO ||
+      branch_block->preds().size() != 1) {
+    TRACE(UCM, 5, "[up code motion] giving up: branch block");
+    return false;
+  }
+
+  std::vector<IRInstruction*> ordered_branch_instructions;
+  // Gather all of the movable instructions of the branch edge
+  // target block; give up when there are any other instructions.
+  if (!gather_movable_instructions(branch_block,
+                                   &ordered_branch_instructions)) {
+    TRACE(UCM, 5, "[up code motion] giving up: gather");
+    return false;
+  }
+
+  cfg::Block* goto_block = goto_edge->target();
+  std::vector<IRInstruction*> ordered_instructions_in_goto_block;
+  // Gather all of the movable instructions of the branch edge
+  // goto block; it's okay if there are other trailing instructions.
+  gather_movable_instructions(goto_block, &ordered_instructions_in_goto_block);
+
+  // In the following, we check if all the registers assigned to by
+  // movable instructions of the branch edge target block also
+  // get assigned by the goto edge target block.
+  std::unordered_map<uint32_t, size_t> goto_instruction_ends;
+  for (size_t i = 0; i < ordered_instructions_in_goto_block.size(); i++) {
+    IRInstruction* insn = ordered_instructions_in_goto_block[i];
+    // only the first emplace for a particular register will stick
+    goto_instruction_ends.emplace(insn->dest(), i + 1);
+  }
+
+  std::unordered_set<uint32_t> destroyed_dests;
+  size_t ordered_instructions_in_goto_block_index_end = 0;
+  for (IRInstruction* insn : ordered_branch_instructions) {
+    uint32_t dest = insn->dest();
+    destroyed_dests.insert(dest);
+    auto it = goto_instruction_ends.find(dest);
+    if (it == goto_instruction_ends.end()) {
+      TRACE(UCM, 5,
+            "[up code motion] giving up: branch instruction assigns to "
+            "dest with no corresponding goto instructions");
+      return false;
+    }
+    ordered_instructions_in_goto_block_index_end =
+        std::max(ordered_instructions_in_goto_block_index_end, it->second);
+  }
+
+  if (destroyed_dests.empty()) {
+    return false;
+  }
+
+  // Do the goto-instructions need any src that the branch-instructions
+  // destroy?
+  for (size_t i = 0; i < ordered_instructions_in_goto_block_index_end; i++) {
+    IRInstruction* insn = ordered_instructions_in_goto_block[i];
+    for (auto src : insn->srcs()) {
+      if (destroyed_dests.count(src)) {
+        TRACE(UCM, 5,
+              "[up code motion] giving up: goto source overlaps with "
+              "branch dest");
+        return false;
+      }
+    }
+    destroyed_dests.erase(insn->dest());
+  }
+
+  // All tests passed. Let's populate instructions_to_insert...
+  for (IRInstruction* insn : ordered_branch_instructions) {
+    insn = new IRInstruction(*insn);
+    instructions_to_insert->push_back(insn);
+  }
+
+  return true;
+}
+
+void UpCodeNotionPass::process_code(bool is_static,
+                                    DexType* declaring_type,
+                                    DexTypeList* args,
+                                    IRCode* code,
+                                    bool is_branch_hot_check,
+                                    DexMethod* method1, const std::unordered_set<std::string> m_white_list_func) {
+  // Stats stats;
+  // if (method::is_clinit(method1)) {
+  //   return;
+  // }
+  // if (!code->editable_cfg_built()) {
+  //     code->build_cfg(/* editable= */ true);
+  //   }
+  //   const auto& cfg = code->cfg();
+  TRACE(UCM, 1, "[START return type analysisi] Processing method %s",
+        method1->get_name()->c_str());
+  bool found_matched_func_name = false;
+  for (const std::string white_list_func_name: m_white_list_func) {
+    if (!strcmp(method1->get_name()->c_str(), const_cast<char*>(white_list_func_name.c_str()))) {
+      found_matched_func_name = true;
+      break;
+    }
+  }
+  if (!found_matched_func_name) {
+    return;
+  }                                                  
+  // SHOW(method1), cfg.num_blocks());
+  auto code1 = method1->get_code();
+  if (code1 == nullptr) {
+    TRACE(UCM, 1,
+          "[return type analysisi fail due to code1 nullptr check] Processing "
+          "method %s",
+          method1->get_name()->c_str());
+    return;
+  }
+  // perform a sanity check on the structure of the method
+  auto sanity_check_succeed = [](IRCode* code1) {
+    // check_no_overwrite_this &= !is_static(method);
+    IRInstruction* this_insn = nullptr;
+    bool has_seen_non_load_param_opcode{false};
+    for (auto it = code1->begin(); it != code1->end(); ++it) {
+      // XXX we are using IRList::iterator instead of InstructionIterator here
+      // because the latter does not support reverse iteration
+      if (it->type != MFLOW_OPCODE) {
+        continue;
+      }
+      auto* insn = it->insn;
+      auto op = insn->opcode();
+      // first sanity check: load parameter should be the first instructions
+      if (has_seen_non_load_param_opcode && opcode::is_a_load_param(op)) {
+        TRACE(
+            UCM, 1,
+            "[upper code motion] Encountered %s not at the start of the method",
+            SHOW(*insn));
+        return false;
+      }
+      has_seen_non_load_param_opcode = !opcode::is_a_load_param(op);
+      // leave as blank for now
+      // The instruction immediately before a move-result instruction must be
+      // either an invoke-* or a filled-new-array instruction.
+      //   if (opcode::is_a_move_result(op)) {
+      //     auto prev = it;
+      //     while (prev != code->begin()) {
+      //       --prev;
+      //       if (prev->type == MFLOW_OPCODE) {
+      //         break;
+      //       }
+      //     }
+      //     if (it == code->begin() || prev->type != MFLOW_OPCODE) {
+      //       return Result::make_error("Encountered " + show(*it) +
+      //                                 " at start of the method");
+      //     }
+      //     auto prev_op = prev->insn->opcode();
+      //     if (!(opcode::is_an_invoke(prev_op) ||
+      //           opcode::is_filled_new_array(prev_op))) {
+      //       return Result::make_error(
+      //           "Encountered " + show(*it) +
+      //           " without appropriate prefix "
+      //           "instruction. Expected invoke or filled-new-array, got " +
+      //           show(prev->insn));
+      //     }
+      //   } else if (opcode::is_a_move_result_pseudo(insn->opcode()) &&
+      //              (it == code->begin() ||
+      //               !has_move_result_pseudo(*std::prev(it)))) {
+      //     return Result::make_error("Encountered " + show(*it) +
+      //                               " without appropriate prefix "
+      //                               "instruction");
+      //   } else if (insn->has_move_result_pseudo() &&
+      //              (it == code->end() || std::next(it) == code->end() ||
+      //               !is_move_result_pseudo(*std::next(it)))) {
+      //     return Result::make_error("Did not find move-result-pseudo after "
+      //     +
+      //                               show(*it) + " in \n" + show(code));
+      //   }
+      // }
+      return true;
+      // return check_uninitialized(method);
+    }
+  };
+  if (!sanity_check_succeed) {
+    TRACE(UCM, 1,
+          "[return type analysisi fail due to sanity check] Processing "
+          "method %s",
+          method1->get_name()->c_str());
+    return;
+  }
+
+  code1->build_cfg(/* editable */ false);
+  // printf("after build_cfg\n");
+
+  cfg::ControlFlowGraph& cfg = code->cfg();
+  // printf("after cfg = code->cfg()\n");
+  TRACE(UCM, 1,
+        "[return type analysisi debug cfg number of exist blocks] Processing "
+        "method %d",
+        cfg.real_exit_blocks().size());
+  // TODO1: check that the load params match the signature
+  // cfg.calculate_exit_block();
+  // printf("after calculate_exit_block()\n");
+
+  type_inference::TypeInference inference1(cfg);
+  // printf(" type_inference::TypeInference inference1(cfg);\n");
+
+  inference1.run(method1);
+  // printf("after sanity check  inference1.run(method1);\n");
+
+  // auto exit_block = cfg.exit_block();
+  // printf("after cfg.exit_block()\n");
+  // TRACE(UCM, 1,
+  //       "[return type analysisi debug cfg number of exist blocks] Processing
+  //       " "method %d", exit_block->empty());
+  // auto exit_env = inference1.get_exit_state_at(exit_block);
+  // printf("after get exist stateat\n");
+
+  bool found_return_value = false;
+  for (auto* exit_block : cfg.real_exit_blocks()) {
+    TRACE(UCM, 1,
+          "[return type analysisi debug exit block empty] Processing "
+          "method %d",
+          exit_block->empty());
+    auto exit_env = inference1.get_exit_state_at(exit_block);
+
+    for (const MethodItemEntry& mie : InstructionIterable(exit_block)) {
+
+      auto insn = mie.insn;
+      // printf("for loop %s\n", SHOW(*insn));
+      TRACE(UCM, 1,
+            "[return type analysisi debug each ins] Processing "
+            "method %s %s",
+            method1->get_name()->c_str(), SHOW(*insn));
+      if (!opcode::is_a_return_value(insn->opcode())) {
+        continue;
+      }
+      // printf("after is_a_return_value\n");
+
+      auto ret_type = exit_env.get_type_domain(insn->src(0));
+      // printf("after get return type\n");
+
+      // TRACE(UCM, 1, "[return type analysisi result] Processing method %s %s
+      // %d",
+      //       SHOW(method1), SHOW(*ret_type.get_dex_type()),
+      //       SHOW(ret_type.is_nullable()));
+      found_return_value = true;
+      TRACE(UCM, 1,
+            "[RESULT return type analysisi result] Processing method %s %d %s",
+            SHOW(method1), ret_type.is_nullable(), SHOW(*insn));
+    }
+  }
+
+  if (!found_return_value) {
+    TRACE(UCM, 1,
+          "[RESULT return type analysisi fail found return value] Processing "
+          "method %s",
+          method1->get_name()->c_str());
+    return;
+  }
+  // printf("after for loop\n");
+
+  // std::unique_ptr<type_inference::TypeInference> type_inference;
+  // std::unordered_set<cfg::Block*> blocks_to_remove_set;
+  // std::vector<cfg::Block*> blocks_to_remove;
+  // for (cfg::Block* b : cfg.blocks()) {
+  //   if (blocks_to_remove_set.count(b)) {
+  //     continue;
+  //   }
+
+  //   auto br = b->branchingness();
+  //   if (br != opcode::BRANCH_IF) {
+  //     continue;
+  //   }
+
+  //   auto last_insn_it = b->get_last_insn();
+  //   always_assert(last_insn_it != b->end());
+
+  //   auto if_insn = last_insn_it->insn;
+  //   always_assert(opcode::is_a_conditional_branch(if_insn->opcode()));
+  //   always_assert(!if_insn->is_wide());
+
+  //   // We found a block that ends with a conditional branch.
+  //   // Let's see if our transformation can be applied.
+  //   cfg::Edge* branch_edge = cfg.get_succ_edge_of_type(b, cfg::EDGE_BRANCH);
+  //   always_assert(branch_edge != nullptr);
+  //   cfg::Edge* goto_edge = cfg.get_succ_edge_of_type(b, cfg::EDGE_GOTO);
+  //   always_assert(goto_edge != nullptr);
+
+  //   std::vector<IRInstruction*> instructions_to_insert;
+  //   std::vector<uint32_t> clobbered_regs;
+  //   // Can we do our code transformation directly?
+  //   if (!gather_instructions_to_insert(branch_edge, goto_edge,
+  //                                      &instructions_to_insert)) {
+  //     // Or do we first have to flip the conditional branch?
+  //     if (!gather_instructions_to_insert(goto_edge, branch_edge,
+  //                                        &instructions_to_insert)) {
+  //       // We just can't do it.
+  //       continue;
+  //     }
+
+  //     // Flip conditional branch before doing actual transformation.
+  //     if_insn->set_opcode(opcode::invert_conditional_branch(if_insn->opcode()));
+  //     // swap goto and branch target
+  //     cfg::Block* branch_target = branch_edge->target();
+  //     cfg::Block* goto_target = goto_edge->target();
+  //     cfg.set_edge_target(branch_edge, goto_target);
+  //     cfg.set_edge_target(goto_edge, branch_target);
+  //     stats.inverted_conditional_branches++;
+  //   }
+
+  //   if (is_branch_hot_check) {
+  //     if (is_hot(b)) {
+  //       if (!is_hot(branch_edge->target())) {
+  //         stats.skipped_branches++;
+  //         continue;
+  //       }
+  //     }
+  //   }
+  //   // We want to insert the (cloned) movable instructions of the branch edge
+  //   // target block just in front of the if-instruction. However, if the if-
+  //   // instruction reads from the same registers that the movable
+  //   // instructions write to, then we have a problem. To work around that
+  //   // problem, we move the problematic registers used by the if-instruction
+  //   to
+  //   // new temp registers, and then rewrite the if-instruction to use the new
+  //   // temp register. Even though the new move instructions increase code
+  //   size
+  //   // here, this is largely undone later by register allocation + copy
+  //   // propagation.
+
+  //   std::unordered_map<uint32_t, uint32_t> temps;
+  //   for (auto instruction_to_insert : instructions_to_insert) {
+  //     auto dest = instruction_to_insert->dest();
+  //     const auto& srcs = if_insn->srcs();
+  //     for (size_t i = 0; i < srcs.size(); i++) {
+  //       if (srcs[i] == dest) {
+  //         uint32_t temp;
+  //         auto temp_it = temps.find(dest);
+  //         if (temp_it != temps.end()) {
+  //           temp = temp_it->second;
+  //         } else {
+  //           if (!type_inference) {
+  //             // We run the type inference once, and reuse results within
+  //             this
+  //             // method. This is okay, even though we mutate the cfg, because
+  //             // we don't change the set of if-instructions, and only do per-
+  //             // instructions lookups in the type environments.
+  //             type_inference.reset(new type_inference::TypeInference(cfg));
+  //             type_inference->run(is_static, declaring_type, args);
+  //           }
+
+  //           auto& type_environments =
+  //           type_inference->get_type_environments(); auto& type_environment =
+  //           type_environments.at(if_insn); auto type =
+  //           type_environment.get_type(dest); always_assert(!type.is_top() &&
+  //           !type.is_bottom());
+
+  //           temp = cfg.allocate_temp();
+  //           auto it = b->to_cfg_instruction_iterator(last_insn_it);
+  //           IRInstruction* move_insn = new IRInstruction(
+  //               type.element() == REFERENCE ? OPCODE_MOVE_OBJECT :
+  //               OPCODE_MOVE);
+  //           move_insn->set_src(0, dest)->set_dest(temp);
+  //           cfg.insert_before(it, move_insn);
+  //           stats.clobbered_registers++;
+  //           temps.emplace(dest, temp);
+  //         }
+  //         if_insn->set_src(i, temp);
+  //       }
+  //     }
+  //   }
+
+  //   // Okay, we can apply our transformation:
+  //   // We insert the (cloned) movable instructions of the branch edge target
+  //   // block just in front of the if-instruction.
+  //   // And then we remove the branch edge target block, rewiring the branch
+  //   edge
+  //   // to point to the goto target of the branch edge target block.
+
+  //   cfg::Block* branch_block = branch_edge->target();
+  //   for (IRInstruction* insn : instructions_to_insert) {
+  //     auto it = b->to_cfg_instruction_iterator(last_insn_it);
+  //     cfg.insert_before(it, insn);
+  //   }
+  //   cfg.set_edge_target(branch_edge, branch_block->goes_to());
+  //   always_assert(!blocks_to_remove_set.count(branch_block));
+  //   blocks_to_remove_set.insert(branch_block);
+  //   blocks_to_remove.push_back(branch_block);
+
+  //   stats.instructions_moved += instructions_to_insert.size();
+  //   stats.branches_moved_over++;
+  // }
+
+  // cfg.remove_blocks(blocks_to_remove);
+
+  // code->clear_cfg();
+  // return stats;
+}
+
+void UpCodeNotionPass::run_pass(DexStoresVector& stores,
+                                ConfigFiles& /* unused */,
+                                PassManager& mgr) {
+  for (const auto& func_name : m_white_list_func) {
+    TRACE(UCM, 1,
+          "[return type analysis config debug: whitelist func name] %s",
+         SHOW(func_name));
+  }
+  auto scope = build_class_scope(stores);
+
+  walk::parallel::methods<>(
+      scope,
+      [&](DexMethod* method) {
+        const auto code = method->get_code();
+        if (!code) {
+          return;
+        }
+
+        UpCodeNotionPass::process_code(is_static(method), method->get_class(),
+                                       method->get_proto()->get_args(), code,
+                                       m_check_if_branch_is_hot, method, m_white_list_func);
+
+        // if (stats_lambda.instructions_moved ||
+        // stats_lambda.branches_moved_over)
+        // {
+        //   TRACE(UCM, 3,
+        //         "[up code motion] Moved %zu instructions over %zu conditional
+        //         " "branches while inverting %zu conditional branches and
+        //         dealing " "with %zu cold branches and %zu clobbered registers
+        //         in {%s}", stats_lambda.instructions_moved,
+        //         stats_lambda.branches_moved_over,
+        //         stats_lambda.inverted_conditional_branches,
+        //         stats_lambda.skipped_branches,
+        //         stats_lambda.clobbered_registers, SHOW(method));
+        // }
+        // return stats_lambda;
+      },
+      1);
+  printf("finish calling process code on each method\n");
+
+  // mgr.incr_metric(METRIC_INSTRUCTIONS_MOVED, stats.instructions_moved);
+  // mgr.incr_metric(METRIC_BRANCHES_MOVED_OVER, stats.branches_moved_over);
+  // mgr.incr_metric(METRIC_INVERTED_CONDITIONAL_BRANCHES,
+  //                 stats.inverted_conditional_branches);
+  // mgr.incr_metric(METRIC_SKIPPED_BRANCHES, stats.skipped_branches);
+  // mgr.incr_metric(METRIC_CLOBBERED_REGISTERS, stats.clobbered_registers);
+  // TRACE(UCM, 1,
+  //       "[up code motion] Moved %zu instructions over %zu conditional
+  //       branches " "while inverting %zu conditional branches and dealing with
+  //       %zu cold " "branches and %zu clobbered registers in total",
+  //       stats.instructions_moved, stats.branches_moved_over,
+  //       stats.inverted_conditional_branches, stats.skipped_branches,
+  //       stats.clobbered_registers);
+}
+
+static UpCodeNotionPass s_pass;
